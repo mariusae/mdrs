@@ -33,6 +33,66 @@ pub struct PagerConfig {
     pub width: usize,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct EmbeddedPagerConfig {
+    pub source: Vec<u8>,
+    pub width: usize,
+    pub height: usize,
+    /// One-based source line to center when possible.
+    pub center_source_line: Option<usize>,
+    pub scroll: isize,
+    pub highlight_terms: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct EmbeddedPagerView {
+    pub lines: Vec<String>,
+    pub top_line: usize,
+}
+
+pub fn render_embedded_pager(config: &EmbeddedPagerConfig) -> io::Result<EmbeddedPagerView> {
+    if config.height == 0 {
+        return Ok(EmbeddedPagerView::default());
+    }
+    let width = config.width.max(1);
+    let result = render_document_with_style(&config.source, width, true, &RenderStyle::default())
+        .map_err(io::Error::other)?;
+    let rendered = result.output.trim_end_matches('\n');
+    if rendered.is_empty() {
+        return Ok(EmbeddedPagerView::default());
+    }
+
+    let lines = rendered.split('\n').map(str::to_owned).collect::<Vec<_>>();
+    let plain = lines
+        .iter()
+        .map(|line| strip_ansi(line))
+        .collect::<Vec<_>>();
+    let center_line = config
+        .center_source_line
+        .and_then(|line| rendered_line_for_source_line(&config.source, line, &result.line_mappings))
+        .unwrap_or(0)
+        .min(lines.len().saturating_sub(1));
+    let max_top = lines.len().saturating_sub(config.height);
+    let top = center_line
+        .saturating_sub(config.height / 2)
+        .saturating_add_signed(config.scroll)
+        .min(max_top);
+    let highlight = format!("{REVERSE}{BOLD}");
+    let visible = lines
+        .iter()
+        .zip(&plain)
+        .skip(top)
+        .take(config.height)
+        .map(|(line, plain)| {
+            highlight_all_matches(line, plain, &config.highlight_terms, &highlight)
+        })
+        .collect();
+    Ok(EmbeddedPagerView {
+        lines: visible,
+        top_line: top,
+    })
+}
+
 pub fn run_pager(config: &PagerConfig) -> io::Result<()> {
     let mut tty = OpenOptions::new()
         .read(true)
@@ -82,6 +142,34 @@ pub fn run_pager(config: &PagerConfig) -> io::Result<()> {
     }
     drop(watcher.take());
     Ok(())
+}
+
+fn rendered_line_for_source_line(
+    source: &[u8],
+    source_line: usize,
+    mappings: &[RenderLineMapping],
+) -> Option<usize> {
+    let line = source_line.checked_sub(1)?;
+    let source = std::str::from_utf8(source).ok()?;
+    let mut start = 0;
+    for (index, text_line) in source.split_inclusive('\n').enumerate() {
+        let end = start + text_line.len();
+        if index == line {
+            return mappings.iter().position(|mapping| {
+                mapping
+                    .spans
+                    .iter()
+                    .any(|span| span.start < end && span.end > start)
+            });
+        }
+        start = end;
+    }
+    (line == source.lines().count()).then(|| {
+        mappings
+            .iter()
+            .position(|mapping| mapping.spans.iter().any(|span| span.start >= source.len()))
+            .unwrap_or_else(|| mappings.len().saturating_sub(1))
+    })
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1811,6 +1899,27 @@ fn find_matches(plain: &str, query: &str) -> Vec<Range> {
 fn highlight_matches(rendered: &str, plain: &str, query: &str, start: &str) -> String {
     highlight_ranges(rendered, &find_matches(plain, query), start)
 }
+fn highlight_all_matches(rendered: &str, plain: &str, queries: &[String], start: &str) -> String {
+    let mut ranges = queries
+        .iter()
+        .flat_map(|query| find_matches(plain, query))
+        .collect::<Vec<_>>();
+    ranges.sort_by_key(|range| (range.start, range.end));
+    let mut merged: Vec<Range> = Vec::new();
+    for range in ranges {
+        if range.start == range.end {
+            continue;
+        }
+        if let Some(last) = merged.last_mut()
+            && range.start <= last.end
+        {
+            last.end = last.end.max(range.end);
+            continue;
+        }
+        merged.push(range);
+    }
+    highlight_ranges(rendered, &merged, start)
+}
 fn highlight_ranges(rendered: &str, ranges: &[Range], start: &str) -> String {
     if start.is_empty() || ranges.is_empty() {
         return rendered.into();
@@ -2322,6 +2431,37 @@ mod tests {
         let highlighted = highlight_matches(&rendered, "hello world", "world", REVERSE);
         assert!(highlighted.contains("\x1b]8;;x"));
         assert!(highlighted.contains(REVERSE));
+    }
+    #[test]
+    fn embedded_pager_centers_source_line() {
+        let view = render_embedded_pager(&EmbeddedPagerConfig {
+            source: b"one\n\ntwo\n\nthree needle\n\nfour\n".to_vec(),
+            width: 80,
+            height: 3,
+            center_source_line: Some(5),
+            ..Default::default()
+        })
+        .unwrap();
+        let plain = view
+            .lines
+            .iter()
+            .map(|line| strip_ansi(line))
+            .collect::<Vec<_>>();
+        assert!(plain.iter().any(|line| line.contains("three needle")));
+    }
+    #[test]
+    fn embedded_pager_highlights_terms_without_status_bar() {
+        let view = render_embedded_pager(&EmbeddedPagerConfig {
+            source: b"# Title\n\nalpha beta gamma\n".to_vec(),
+            width: 80,
+            height: 4,
+            highlight_terms: vec!["alpha".into(), "gamma".into()],
+            ..Default::default()
+        })
+        .unwrap();
+        let rendered = view.lines.join("\n");
+        assert!(rendered.contains(REVERSE));
+        assert!(!strip_ansi(&rendered).contains("100%"));
     }
     #[test]
     fn relative_times() {

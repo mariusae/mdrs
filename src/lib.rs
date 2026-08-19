@@ -10,7 +10,9 @@ mod pager;
 mod render;
 mod style;
 
-pub use pager::{PagerConfig, run_pager};
+pub use pager::{
+    EmbeddedPagerConfig, EmbeddedPagerView, PagerConfig, render_embedded_pager, run_pager,
+};
 pub use render::{
     AnsiRenderer, CodeBlock, Heading, RenderError, RenderResult, Result, extract_headings, render,
     render_document, render_document_with_style, render_to, render_to_with_style,
