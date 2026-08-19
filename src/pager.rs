@@ -991,14 +991,23 @@ impl Pager {
             }
             return Ok(());
         }
-        if mouse.pressed
-            && mouse.base() == 0
-            && let Some(url) = self.link_at(mouse.row, mouse.col).map(str::to_owned)
-        {
-            self.open_link(&url);
-            return Ok(());
+        let link_release = self.link_release(mouse);
+        self.selection_mouse(mouse, tty).map(|()| {
+            if let Some(url) = link_release {
+                self.open_link(&url);
+            }
+        })
+    }
+
+    fn link_release(&self, mouse: Mouse) -> Option<String> {
+        if mouse.pressed || mouse.motion() || mouse.base() != 0 || !self.selection.selecting {
+            return None;
         }
-        self.selection_mouse(mouse, tty)
+        let cell = self.mouse_cell(mouse.row, mouse.col)?;
+        if self.selection.dragged || cell != self.selection.current {
+            return None;
+        }
+        self.link_at(mouse.row, mouse.col).map(str::to_owned)
     }
 
     fn link_at(&self, row: usize, col: usize) -> Option<&str> {
@@ -2533,6 +2542,7 @@ impl Drop for ScreenGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     fn pager(source: &str) -> Pager {
         let mut pager = Pager::new(
@@ -2770,6 +2780,85 @@ mod tests {
             String::from_utf8(p.selection_markdown()).unwrap(),
             "- alpha\n- beta"
         );
+    }
+    #[test]
+    fn link_click_navigates_on_release() {
+        let mut p = pager("[alpha](reflect-note:alpha)\n");
+        let opened = Arc::new(AtomicUsize::new(0));
+        let opened_for_callback = Arc::clone(&opened);
+        p.cfg.link_opener = Some(Arc::new(move |_| {
+            opened_for_callback.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(None)
+        }));
+        let mut tty = OpenOptions::new().write(true).open("/dev/null").unwrap();
+
+        p.handle_mouse(
+            Mouse {
+                button: 0,
+                row: 1,
+                col: 1,
+                pressed: true,
+            },
+            &mut tty,
+        )
+        .unwrap();
+        assert_eq!(opened.load(AtomicOrdering::SeqCst), 0);
+
+        p.handle_mouse(
+            Mouse {
+                button: 0,
+                row: 1,
+                col: 1,
+                pressed: false,
+            },
+            &mut tty,
+        )
+        .unwrap();
+        assert_eq!(opened.load(AtomicOrdering::SeqCst), 1);
+    }
+    #[test]
+    fn dragged_selection_does_not_navigate_on_link_release() {
+        let mut p = pager("[alpha](reflect-note:alpha)\n");
+        let opened = Arc::new(AtomicUsize::new(0));
+        let opened_for_callback = Arc::clone(&opened);
+        p.cfg.link_opener = Some(Arc::new(move |_| {
+            opened_for_callback.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(None)
+        }));
+        let mut tty = OpenOptions::new().write(true).open("/dev/null").unwrap();
+
+        p.handle_mouse(
+            Mouse {
+                button: 0,
+                row: 1,
+                col: 1,
+                pressed: true,
+            },
+            &mut tty,
+        )
+        .unwrap();
+        p.handle_mouse(
+            Mouse {
+                button: 32,
+                row: 1,
+                col: 3,
+                pressed: true,
+            },
+            &mut tty,
+        )
+        .unwrap();
+        p.handle_mouse(
+            Mouse {
+                button: 0,
+                row: 1,
+                col: 3,
+                pressed: false,
+            },
+            &mut tty,
+        )
+        .unwrap();
+
+        assert_eq!(opened.load(AtomicOrdering::SeqCst), 0);
     }
     #[test]
     fn search_state_uses_nearest_match() {
