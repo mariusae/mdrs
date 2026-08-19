@@ -1,6 +1,11 @@
 use pretty_assertions::assert_eq;
 
-use mdrs::{BOLD, DIM, FG_BLUE, OSC8_END, RESET, RenderStyle, UNDERLINE};
+use std::sync::Arc;
+
+use mdrs::{
+    BOLD, DIM, FG_BLUE, LinkKind, LinkResolution, OSC8_END, RESET, RenderOptions, RenderStyle,
+    UNDERLINE,
+};
 
 #[test]
 fn structured_result_tracks_headings_and_code_blocks() {
@@ -60,6 +65,36 @@ fn osc8_links_hide_the_destination_suffix() {
             OSC8_END,
         )
     );
+}
+
+#[test]
+fn render_options_resolve_wiki_links_and_report_hit_ranges() {
+    let result = mdrs::render_document_with_options(
+        b"See [[capture-1|Readable Title]].\n",
+        &RenderOptions {
+            width: 80,
+            osc8: true,
+            link_resolver: Some(Arc::new(|request| {
+                assert_eq!(request.kind, LinkKind::Wiki);
+                assert_eq!(request.target, "capture-1");
+                assert_eq!(request.label.as_deref(), Some("Readable Title"));
+                Some(LinkResolution {
+                    url: "reflect:notes/capture-1.md".into(),
+                    label: None,
+                })
+            })),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert!(result.output.contains("Readable Title"));
+    assert!(!result.output.contains("capture-1|"));
+    assert_eq!(result.links.len(), 1);
+    assert_eq!(result.links[0].url, "reflect:notes/capture-1.md");
+    assert_eq!(result.links[0].line, 0);
+    assert_eq!(result.links[0].start_col, 4);
+    assert_eq!(result.links[0].end_col, 18);
 }
 
 #[test]

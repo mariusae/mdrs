@@ -1,5 +1,6 @@
 use std::fmt::Write as _;
 use std::io::{self, Write};
+use std::sync::Arc;
 
 use comrak::nodes::{AstNode, ListType, NodeValue, TableAlignment};
 use comrak::{Arena, Options, parse_document};
@@ -23,12 +24,61 @@ pub struct CodeBlock {
     pub text: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RenderedLink {
+    pub url: String,
+    pub line: usize,
+    pub start_col: usize,
+    pub end_col: usize,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RenderResult {
     pub output: String,
     pub headings: Vec<Heading>,
     pub code_blocks: Vec<CodeBlock>,
+    pub links: Vec<RenderedLink>,
     pub(crate) line_mappings: Vec<RenderLineMapping>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LinkKind {
+    Markdown,
+    Wiki,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LinkRequest {
+    pub kind: LinkKind,
+    pub target: String,
+    pub label: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LinkResolution {
+    pub url: String,
+    pub label: Option<String>,
+}
+
+pub type LinkResolver = Arc<dyn Fn(&LinkRequest) -> Option<LinkResolution> + Send + Sync>;
+
+#[derive(Clone)]
+pub struct RenderOptions {
+    pub width: usize,
+    pub osc8: bool,
+    pub style: RenderStyle,
+    pub link_resolver: Option<LinkResolver>,
+}
+
+impl Default for RenderOptions {
+    fn default() -> Self {
+        Self {
+            width: 0,
+            osc8: false,
+            style: RenderStyle::default(),
+            link_resolver: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -96,10 +146,25 @@ pub fn render_document_with_style(
     osc8: bool,
     style: &RenderStyle,
 ) -> Result<RenderResult> {
+    render_document_with_options(
+        source,
+        &RenderOptions {
+            width,
+            osc8,
+            style: style.clone(),
+            link_resolver: None,
+        },
+    )
+}
+
+pub fn render_document_with_options(
+    source: &[u8],
+    options: &RenderOptions,
+) -> Result<RenderResult> {
     let source = std::str::from_utf8(source)?;
     let (front_matter, body) = split_front_matter(source);
     let body_offset = body.as_ptr() as usize - source.as_ptr() as usize;
-    let mut renderer = AnsiRenderer::new(width, osc8, style.clone());
+    let mut renderer = AnsiRenderer::with_options(options.clone());
     renderer.render_source(body);
     let mut result = renderer.finish();
     offset_mappings(&mut result.line_mappings, body_offset);
@@ -109,7 +174,11 @@ pub fn render_document_with_style(
         if !front.is_empty() && !front.ends_with('\n') {
             prefix.push('\n');
         }
-        let hr_width = if width == 0 { 40 } else { width };
+        let hr_width = if options.width == 0 {
+            40
+        } else {
+            options.width
+        };
         let _ = write!(prefix, "{DIM}{}{RESET}\n\n", "─".repeat(hr_width));
         let line_offset = prefix.matches('\n').count();
         for heading in &mut result.headings {
@@ -125,6 +194,7 @@ pub fn render_document_with_style(
         result.line_mappings.splice(0..0, front_mappings);
         result.output.insert_str(0, &prefix);
     }
+    result.links = extract_rendered_links(&result.output);
     Ok(result)
 }
 
@@ -244,6 +314,7 @@ pub struct AnsiRenderer {
     osc8: bool,
     headings: Vec<Heading>,
     render_style: RenderStyle,
+    link_resolver: Option<LinkResolver>,
     code_blocks: Vec<CodeBlock>,
     source: String,
     line_mappings: Vec<RenderLineMapping>,
@@ -252,10 +323,20 @@ pub struct AnsiRenderer {
 
 impl AnsiRenderer {
     pub fn new(width: usize, osc8: bool, render_style: RenderStyle) -> Self {
-        Self {
+        Self::with_options(RenderOptions {
             width,
             osc8,
-            render_style,
+            style: render_style,
+            link_resolver: None,
+        })
+    }
+
+    pub fn with_options(options: RenderOptions) -> Self {
+        Self {
+            width: options.width,
+            osc8: options.osc8,
+            render_style: options.style,
+            link_resolver: options.link_resolver,
             ..Self::empty()
         }
     }
@@ -275,6 +356,7 @@ impl AnsiRenderer {
             osc8: false,
             headings: Vec::new(),
             render_style: RenderStyle::default(),
+            link_resolver: None,
             code_blocks: Vec::new(),
             source: String::new(),
             line_mappings: Vec::new(),
@@ -314,6 +396,7 @@ impl AnsiRenderer {
             output: self.output,
             headings: self.headings,
             code_blocks: self.code_blocks,
+            links: Vec::new(),
             line_mappings: self.line_mappings,
         }
     }
@@ -417,11 +500,7 @@ impl AnsiRenderer {
                 self.pop_span();
             }
             NodeValue::Text(text) => {
-                if self.current_span().valid() {
-                    self.write_wrapped(&text);
-                } else {
-                    self.write_wrapped_mapped(&text, self.text_spans(node, &text));
-                }
+                self.render_text(node, &text);
             }
             NodeValue::SoftBreak => {
                 self.write_wrapped_mapped(" ", vec![self.node_source_span(node)]);
@@ -552,9 +631,107 @@ impl AnsiRenderer {
         self.newline();
     }
 
-    fn render_link<'a>(&mut self, node: &'a AstNode<'a>, url: &str, tight: bool) {
+    fn render_text(&mut self, node: &AstNode<'_>, text: &str) {
+        let Some(resolver) = self.link_resolver.clone() else {
+            self.render_plain_text(node, text);
+            return;
+        };
+        let mut rest = text;
+        while let Some(start) = rest.find("[[") {
+            let before = &rest[..start];
+            self.render_plain_text(node, before);
+            let candidate = &rest[start + 2..];
+            let Some(end) = candidate.find("]]") else {
+                self.render_plain_text(node, &rest[start..]);
+                return;
+            };
+            let inner = &candidate[..end];
+            let (target, alias) = split_wiki_link(inner);
+            if target.trim().is_empty() {
+                self.render_plain_text(node, &rest[start..start + end + 4]);
+            } else {
+                let request = LinkRequest {
+                    kind: LinkKind::Wiki,
+                    target: target.to_string(),
+                    label: alias.map(str::to_string),
+                };
+                if let Some(resolution) = resolver(&request) {
+                    let label = resolution
+                        .label
+                        .as_deref()
+                        .or(request.label.as_deref())
+                        .unwrap_or(&request.target)
+                        .to_string();
+                    self.render_resolved_link_text(&label, &resolution.url);
+                } else {
+                    self.render_plain_text(node, &rest[start..start + end + 4]);
+                }
+            }
+            rest = &candidate[end + 2..];
+        }
+        self.render_plain_text(node, rest);
+    }
+
+    fn render_plain_text(&mut self, node: &AstNode<'_>, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if self.current_span().valid() {
+            self.write_wrapped(text);
+        } else {
+            self.write_wrapped_mapped(text, self.text_spans(node, text));
+        }
+    }
+
+    fn render_resolved_link_text(&mut self, label: &str, url: &str) {
         if self.osc8 {
             self.write_raw(&osc8_start(url));
+            self.push_style(TextStyle {
+                color: FG_BLUE.into(),
+                underline: true,
+                ..Default::default()
+            });
+            self.write_wrapped(label);
+            self.pop_style();
+            self.write_raw(OSC8_END);
+        } else {
+            self.push_style(TextStyle {
+                color: FG_BLUE.into(),
+                ..Default::default()
+            });
+            self.write_wrapped(label);
+            self.write_wrapped(" (");
+            self.push_style(TextStyle {
+                underline: true,
+                ..Default::default()
+            });
+            self.write_wrapped(url);
+            self.pop_style();
+            self.write_wrapped(")");
+            self.pop_style();
+        }
+    }
+
+    fn render_link<'a>(&mut self, node: &'a AstNode<'a>, url: &str, tight: bool) {
+        let resolved = self.link_resolver.as_ref().and_then(|resolver| {
+            resolver(&LinkRequest {
+                kind: LinkKind::Markdown,
+                target: url.to_string(),
+                label: None,
+            })
+        });
+        let href = resolved
+            .as_ref()
+            .map_or(url, |resolution| resolution.url.as_str());
+        if let Some(label) = resolved
+            .as_ref()
+            .and_then(|resolution| resolution.label.as_deref())
+        {
+            self.render_resolved_link_text(label, href);
+            return;
+        }
+        if self.osc8 {
+            self.write_raw(&osc8_start(href));
             self.push_style(TextStyle {
                 color: FG_BLUE.into(),
                 underline: true,
@@ -574,7 +751,7 @@ impl AnsiRenderer {
                 underline: true,
                 ..Default::default()
             });
-            self.write_wrapped(url);
+            self.write_wrapped(href);
             self.pop_style();
             self.write_wrapped(")");
             self.pop_style();
@@ -922,6 +1099,83 @@ fn escape_sequence_end(text: &str, start: usize) -> usize {
             bytes.len()
         }
         _ => (start + 2).min(bytes.len()),
+    }
+}
+
+fn split_wiki_link(inner: &str) -> (&str, Option<&str>) {
+    match inner.split_once('|') {
+        Some((target, label)) => (target, Some(label)),
+        None => (inner, None),
+    }
+}
+
+fn extract_rendered_links(text: &str) -> Vec<RenderedLink> {
+    let mut links = Vec::new();
+    let mut active_url: Option<String> = None;
+    let mut current: Option<RenderedLink> = None;
+    let mut line = 0;
+    let mut col = 0;
+    let mut index = 0;
+    while index < text.len() {
+        if text.as_bytes()[index] == 0x1b {
+            if let Some((url, end)) = osc8_url(text, index) {
+                flush_link(&mut links, &mut current);
+                active_url = (!url.is_empty()).then_some(url.to_string());
+                index = end;
+            } else {
+                index = escape_sequence_end(text, index);
+            }
+            continue;
+        }
+        let character = text[index..].chars().next().unwrap();
+        index += character.len_utf8();
+        if character == '\n' {
+            flush_link(&mut links, &mut current);
+            line += 1;
+            col = 0;
+            continue;
+        }
+        let width = character.width().unwrap_or(0);
+        if width == 0 {
+            continue;
+        }
+        if let Some(url) = active_url.as_deref() {
+            match &mut current {
+                Some(range) if range.url == url && range.line == line && range.end_col == col => {
+                    range.end_col += width;
+                }
+                _ => {
+                    flush_link(&mut links, &mut current);
+                    current = Some(RenderedLink {
+                        url: url.to_string(),
+                        line,
+                        start_col: col,
+                        end_col: col + width,
+                    });
+                }
+            }
+        }
+        col += width;
+    }
+    flush_link(&mut links, &mut current);
+    links
+}
+
+fn osc8_url(text: &str, start: usize) -> Option<(&str, usize)> {
+    let rest = text.get(start..)?;
+    let content = rest.strip_prefix("\x1b]8;;")?;
+    if let Some(end) = content.find('\x07') {
+        return Some((&content[..end], start + 5 + end + 1));
+    }
+    let end = content.find("\x1b\\")?;
+    Some((&content[..end], start + 5 + end + 2))
+}
+
+fn flush_link(links: &mut Vec<RenderedLink>, current: &mut Option<RenderedLink>) {
+    if let Some(link) = current.take()
+        && link.start_col < link.end_col
+    {
+        links.push(link);
     }
 }
 

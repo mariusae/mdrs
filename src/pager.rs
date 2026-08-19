@@ -11,8 +11,10 @@ use base64::Engine;
 use notify::{EventKind, RecursiveMode, Watcher};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::render::{CodeBlock, RenderLineMapping, SourceSpan};
-use crate::{BOLD, DIM, Heading, RESET, REVERSE, RenderStyle, render_document_with_style};
+use crate::render::{
+    CodeBlock, LinkResolver, RenderLineMapping, RenderOptions, RenderedLink, SourceSpan,
+};
+use crate::{BOLD, DIM, Heading, RESET, REVERSE, RenderStyle, render_document_with_options};
 
 const ENTER_ALT: &str = "\x1b[?1049h";
 const EXIT_ALT: &str = "\x1b[?1049l";
@@ -25,15 +27,26 @@ const DISABLE_MOUSE: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 const QUERY_BACKGROUND: &str = "\x1b]11;?\x1b\\";
 const FLASH_DURATION: Duration = Duration::from_secs(2);
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct PagerConfig {
     pub paths: Vec<PathBuf>,
     pub initial_source: Vec<u8>,
     pub label: String,
     pub width: usize,
+    pub link_resolver: Option<LinkResolver>,
+    pub link_opener: Option<LinkOpener>,
 }
 
 #[derive(Clone, Debug, Default)]
+pub struct PagerDocument {
+    pub paths: Vec<PathBuf>,
+    pub source: Vec<u8>,
+    pub label: String,
+}
+
+pub type LinkOpener = Arc<dyn Fn(&str) -> io::Result<Option<PagerDocument>> + Send + Sync>;
+
+#[derive(Clone, Default)]
 pub struct EmbeddedPagerConfig {
     pub source: Vec<u8>,
     pub width: usize,
@@ -43,6 +56,7 @@ pub struct EmbeddedPagerConfig {
     pub scroll: isize,
     pub highlight_terms: Vec<String>,
     pub render_style: RenderStyle,
+    pub link_resolver: Option<LinkResolver>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -59,6 +73,7 @@ pub struct EmbeddedPagerView {
     pub lines: Vec<String>,
     pub top_line: usize,
     pub code_blocks: Vec<EmbeddedCodeBlock>,
+    pub links: Vec<RenderedLink>,
 }
 
 pub fn render_embedded_pager(config: &EmbeddedPagerConfig) -> io::Result<EmbeddedPagerView> {
@@ -66,8 +81,16 @@ pub fn render_embedded_pager(config: &EmbeddedPagerConfig) -> io::Result<Embedde
         return Ok(EmbeddedPagerView::default());
     }
     let width = config.width.max(1);
-    let result = render_document_with_style(&config.source, width, true, &config.render_style)
-        .map_err(io::Error::other)?;
+    let result = render_document_with_options(
+        &config.source,
+        &RenderOptions {
+            width,
+            osc8: true,
+            style: config.render_style.clone(),
+            link_resolver: config.link_resolver.clone(),
+        },
+    )
+    .map_err(io::Error::other)?;
     let rendered = result.output.trim_end_matches('\n');
     if rendered.is_empty() {
         return Ok(EmbeddedPagerView::default());
@@ -122,6 +145,18 @@ pub fn render_embedded_pager(config: &EmbeddedPagerConfig) -> io::Result<Embedde
         lines: visible,
         top_line: top,
         code_blocks,
+        links: result
+            .links
+            .into_iter()
+            .filter_map(|mut link| {
+                if link.line >= top && link.line < top + config.height {
+                    link.line -= top;
+                    Some(link)
+                } else {
+                    None
+                }
+            })
+            .collect(),
     })
 }
 
@@ -282,6 +317,7 @@ struct Pager {
     lines: Vec<String>,
     mappings: Vec<RenderLineMapping>,
     blocks: Vec<CodeBlock>,
+    links: Vec<RenderedLink>,
     plain: Vec<String>,
     top: usize,
     query: String,
@@ -299,6 +335,14 @@ struct Pager {
     flash_until: Option<Instant>,
     help: bool,
     flow: bool,
+    back_stack: Vec<PagerSnapshot>,
+    forward_stack: Vec<PagerSnapshot>,
+}
+
+#[derive(Clone, Debug)]
+struct PagerSnapshot {
+    document: PagerDocument,
+    top: usize,
 }
 
 impl Pager {
@@ -316,6 +360,7 @@ impl Pager {
             lines: vec![],
             mappings: vec![],
             blocks: vec![],
+            links: vec![],
             plain: vec![],
             top: 0,
             query: String::new(),
@@ -333,6 +378,8 @@ impl Pager {
             flash_until: None,
             help: false,
             flow: false,
+            back_stack: Vec::new(),
+            forward_stack: Vec::new(),
         }
     }
     fn resize(&mut self, width: usize, height: usize) {
@@ -385,6 +432,73 @@ impl Pager {
         }
         Ok((all, latest))
     }
+
+    fn snapshot(&self) -> PagerSnapshot {
+        PagerSnapshot {
+            document: PagerDocument {
+                paths: self.cfg.paths.clone(),
+                source: self.source.clone(),
+                label: self.cfg.label.clone(),
+            },
+            top: self.top,
+        }
+    }
+
+    fn apply_snapshot(&mut self, snapshot: PagerSnapshot) {
+        self.apply_document(snapshot.document, snapshot.top);
+    }
+
+    fn apply_document(&mut self, document: PagerDocument, top: usize) {
+        self.cfg.paths = document.paths;
+        self.cfg.initial_source = document.source;
+        self.cfg.label = if document.label.is_empty() {
+            pager_label(&self.cfg.paths)
+        } else {
+            document.label
+        };
+        match self.reload(true) {
+            Ok(()) => {
+                self.top = top.min(self.max_top());
+                self.clear_notice();
+            }
+            Err(error) => self.set_notice(error.to_string(), true),
+        }
+    }
+
+    fn open_link(&mut self, url: &str) {
+        let Some(opener) = self.cfg.link_opener.clone() else {
+            self.set_notice(format!("No opener for {url}"), true);
+            return;
+        };
+        match opener(url) {
+            Ok(Some(document)) => {
+                self.back_stack.push(self.snapshot());
+                self.forward_stack.clear();
+                self.apply_document(document, 0);
+            }
+            Ok(None) => self.set_notice(format!("No note for {url}"), true),
+            Err(error) => self.set_notice(error.to_string(), true),
+        }
+    }
+
+    fn navigate_back(&mut self) {
+        let Some(snapshot) = self.back_stack.pop() else {
+            self.set_notice("No back history".into(), true);
+            return;
+        };
+        self.forward_stack.push(self.snapshot());
+        self.apply_snapshot(snapshot);
+    }
+
+    fn navigate_forward(&mut self) {
+        let Some(snapshot) = self.forward_stack.pop() else {
+            self.set_notice("No forward history".into(), true);
+            return;
+        };
+        self.back_stack.push(self.snapshot());
+        self.apply_snapshot(snapshot);
+    }
+
     fn reload(&mut self, initial: bool) -> io::Result<()> {
         let (source, modified) = match self.load() {
             Ok(value) => value,
@@ -420,11 +534,14 @@ impl Pager {
             .and_then(|index| self.matches.get(index))
             .copied()
             .unwrap_or(self.top);
-        let result = render_document_with_style(
+        let result = render_document_with_options(
             &self.source,
-            self.render_width(),
-            true,
-            &self.theme.render_style(),
+            &RenderOptions {
+                width: self.render_width(),
+                osc8: true,
+                style: self.theme.render_style(),
+                link_resolver: self.cfg.link_resolver.clone(),
+            },
         )
         .map_err(io::Error::other)?;
         self.headings = result.headings;
@@ -433,6 +550,7 @@ impl Pager {
             self.lines.clear();
             self.mappings.clear();
             self.blocks.clear();
+            self.links.clear();
             self.plain.clear();
             self.headings.clear();
             self.top = 0;
@@ -441,6 +559,7 @@ impl Pager {
             self.mappings = result.line_mappings;
             self.mappings.truncate(self.lines.len());
             self.blocks = result.code_blocks;
+            self.links = result.links;
             self.plain = self.lines.iter().map(|line| strip_ansi(line)).collect();
             self.top = self.top.min(self.max_top());
         }
@@ -520,6 +639,8 @@ impl Pager {
                 self.flow = !self.flow;
                 let _ = self.rebuild();
             }
+            Key::Char('[') => self.navigate_back(),
+            Key::Char(']') => self.navigate_forward(),
             Key::Char('q') | Key::Ctrl('c') => return true,
             _ => {}
         }
@@ -870,7 +991,28 @@ impl Pager {
             }
             return Ok(());
         }
+        if mouse.pressed
+            && mouse.base() == 0
+            && let Some(url) = self.link_at(mouse.row, mouse.col).map(str::to_owned)
+        {
+            self.open_link(&url);
+            return Ok(());
+        }
         self.selection_mouse(mouse, tty)
+    }
+
+    fn link_at(&self, row: usize, col: usize) -> Option<&str> {
+        if row < 1 || row > self.view_height() || col < self.content_left() {
+            return None;
+        }
+        let line = self.top + row - 1;
+        let visible_col = col - self.content_left();
+        self.links
+            .iter()
+            .find(|link| {
+                link.line == line && visible_col >= link.start_col && visible_col < link.end_col
+            })
+            .map(|link| link.url.as_str())
     }
     fn code_button(&self, row: usize, col: usize) -> Option<&CodeBlock> {
         if col != self.content_left() || row < 1 || row > self.view_height() {
@@ -1219,6 +1361,12 @@ impl Pager {
         let mut extra = vec![];
         if self.flow {
             extra.push("flow".into())
+        }
+        if !self.back_stack.is_empty() {
+            extra.push(format!("← {}", self.back_stack.len()))
+        }
+        if !self.forward_stack.is_empty() {
+            extra.push(format!("{} →", self.forward_stack.len()))
         }
         if !self.query.is_empty() {
             extra.push(if self.matches.is_empty() {

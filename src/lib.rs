@@ -11,13 +11,14 @@ mod render;
 mod style;
 
 pub use pager::{
-    EmbeddedCodeBlock, EmbeddedPagerConfig, EmbeddedPagerView, PagerConfig, copy_osc52_to,
-    render_embedded_pager, run_pager,
+    EmbeddedCodeBlock, EmbeddedPagerConfig, EmbeddedPagerView, LinkOpener, PagerConfig,
+    PagerDocument, copy_osc52_to, render_embedded_pager, run_pager,
 };
 pub use render::{
-    AnsiRenderer, CodeBlock, Heading, RenderError, RenderResult, Result, extract_headings, render,
-    render_document, render_document_with_style, render_to, render_to_with_style,
-    render_with_style,
+    AnsiRenderer, CodeBlock, Heading, LinkKind, LinkRequest, LinkResolution, LinkResolver,
+    RenderError, RenderOptions, RenderResult, RenderedLink, Result, extract_headings, render,
+    render_document, render_document_with_options, render_document_with_style, render_to,
+    render_to_with_style, render_with_style,
 };
 pub use style::{RenderStyle, detect_render_style};
 
