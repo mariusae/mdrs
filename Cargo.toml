@@ -6,7 +6,10 @@ description = "Terminal Markdown renderer compatible with github.com/mariusae/md
 
 [dependencies]
 comrak = { version = "0.54.0", default-features = false }
+base64 = "0.22.1"
 libc = "0.2.175"
+notify = "8.2.0"
+signal-hook = "0.3.18"
 thiserror = "2.0.16"
 unicode-width = "0.2.1"
 

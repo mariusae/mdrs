@@ -13,3 +13,17 @@ assert_eq!(rendered, "\x1b[1mHello\x1b[0m\n\n");
 The crate also exposes heading extraction, structured render results (including
 rendered heading and code-block locations), optional OSC-8 links, custom tint
 styles, writer-oriented rendering, and a library pager entry point.
+
+```rust,no_run
+mdrs::run_pager(&mdrs::PagerConfig {
+    paths: vec!["README.md".into()],
+    ..Default::default()
+})?;
+# Ok::<(), std::io::Error>(())
+```
+
+The pager includes the Go implementation's navigation, flow layout, search,
+filtered heading outline, help overlay, live file reload and change flashes,
+mouse scrolling and selection, source-preserving Markdown copy, code-block
+copy buttons, OSC-52 clipboard support, status breadcrumbs, terminal tinting,
+focus handling, and resize handling.

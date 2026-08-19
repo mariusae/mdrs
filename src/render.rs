@@ -28,6 +28,24 @@ pub struct RenderResult {
     pub output: String,
     pub headings: Vec<Heading>,
     pub code_blocks: Vec<CodeBlock>,
+    pub(crate) line_mappings: Vec<RenderLineMapping>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct SourceSpan {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+}
+
+impl SourceSpan {
+    pub(crate) fn valid(self) -> bool {
+        self.end > self.start
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RenderLineMapping {
+    pub(crate) spans: Vec<SourceSpan>,
 }
 
 #[derive(Debug, Error)]
@@ -80,9 +98,11 @@ pub fn render_document_with_style(
 ) -> Result<RenderResult> {
     let source = std::str::from_utf8(source)?;
     let (front_matter, body) = split_front_matter(source);
+    let body_offset = body.as_ptr() as usize - source.as_ptr() as usize;
     let mut renderer = AnsiRenderer::new(width, osc8, style.clone());
     renderer.render_source(body);
     let mut result = renderer.finish();
+    offset_mappings(&mut result.line_mappings, body_offset);
 
     if let Some(front) = front_matter {
         let mut prefix = front.to_owned();
@@ -100,9 +120,57 @@ pub fn render_document_with_style(
         for block in &mut result.code_blocks {
             block.line += line_offset;
         }
+        let front_offset = front.as_ptr() as usize - source.as_ptr() as usize;
+        let front_mappings = front_matter_mappings(front, front_offset, &prefix);
+        result.line_mappings.splice(0..0, front_mappings);
         result.output.insert_str(0, &prefix);
     }
     Ok(result)
+}
+
+fn offset_mappings(mappings: &mut [RenderLineMapping], offset: usize) {
+    for mapping in mappings {
+        for span in &mut mapping.spans {
+            if span.valid() {
+                span.start += offset;
+                span.end += offset;
+            }
+        }
+    }
+}
+
+fn front_matter_mappings(front: &str, offset: usize, rendered: &str) -> Vec<RenderLineMapping> {
+    let mut mappings = vec![RenderLineMapping::default()];
+    let mut source_offset = offset;
+    let front_end = front.len();
+    let mut visible_index = 0;
+    let mut index = 0;
+    while index < rendered.len() {
+        if rendered.as_bytes()[index] == 0x1b {
+            index = escape_sequence_end(rendered, index);
+            continue;
+        }
+        let character = rendered[index..].chars().next().unwrap();
+        index += character.len_utf8();
+        let span = if visible_index < front_end {
+            let size = front[visible_index..].chars().next().unwrap().len_utf8();
+            let span = SourceSpan {
+                start: source_offset,
+                end: source_offset + size,
+            };
+            visible_index += size;
+            source_offset += size;
+            span
+        } else {
+            SourceSpan::default()
+        };
+        if character == '\n' {
+            mappings.push(RenderLineMapping::default());
+            continue;
+        }
+        mappings.last_mut().unwrap().spans.push(span);
+    }
+    mappings
 }
 
 pub fn extract_headings(source: &[u8]) -> Result<Vec<Heading>> {
@@ -178,6 +246,8 @@ pub struct AnsiRenderer {
     render_style: RenderStyle,
     code_blocks: Vec<CodeBlock>,
     source: String,
+    line_mappings: Vec<RenderLineMapping>,
+    span_stack: Vec<SourceSpan>,
 }
 
 impl AnsiRenderer {
@@ -207,6 +277,8 @@ impl AnsiRenderer {
             render_style: RenderStyle::default(),
             code_blocks: Vec::new(),
             source: String::new(),
+            line_mappings: Vec::new(),
+            span_stack: Vec::new(),
         }
     }
 
@@ -242,6 +314,7 @@ impl AnsiRenderer {
             output: self.output,
             headings: self.headings,
             code_blocks: self.code_blocks,
+            line_mappings: self.line_mappings,
         }
     }
 
@@ -250,6 +323,7 @@ impl AnsiRenderer {
         match value {
             NodeValue::Document => self.render_children(node, tight_list),
             NodeValue::Heading(heading) => {
+                self.push_span(self.node_block_span(node));
                 let text = extract_text(node).trim().to_owned();
                 self.headings.push(Heading {
                     level: heading.level,
@@ -262,6 +336,7 @@ impl AnsiRenderer {
                 });
                 self.render_children(node, tight_list);
                 self.pop_style();
+                self.pop_span();
                 self.newline();
                 self.newline();
             }
@@ -278,6 +353,7 @@ impl AnsiRenderer {
                 }
             }
             NodeValue::CodeBlock(code) => {
+                self.push_span(self.node_block_span(node));
                 self.code_blocks.push(CodeBlock {
                     line: self.line,
                     text: code.literal.clone(),
@@ -304,13 +380,16 @@ impl AnsiRenderer {
                 }
                 self.newline();
                 self.col = 0;
+                self.pop_span();
             }
             NodeValue::BlockQuote => {
+                self.push_span(self.node_block_span(node));
                 self.blockquote_depth += 1;
                 self.indent += 2;
                 self.render_children(node, tight_list);
                 self.blockquote_depth -= 1;
                 self.indent -= 2;
+                self.pop_span();
             }
             NodeValue::List(list) => {
                 self.list_depth += 1;
@@ -325,43 +404,64 @@ impl AnsiRenderer {
             }
             NodeValue::Item(_) => self.render_list_item(node, tight_list),
             NodeValue::ThematicBreak => {
+                self.push_span(self.node_block_span(node));
                 let width = if self.width == 0 { 40 } else { self.width };
                 self.write_raw(&"─".repeat(width));
                 self.newline();
                 self.newline();
+                self.pop_span();
             }
-            NodeValue::HtmlBlock(html) => self.write_raw(&html.literal),
-            NodeValue::Text(text) => self.write_wrapped(&text),
-            NodeValue::SoftBreak => self.write_wrapped(" "),
+            NodeValue::HtmlBlock(html) => {
+                self.push_span(self.node_block_span(node));
+                self.write_raw(&html.literal);
+                self.pop_span();
+            }
+            NodeValue::Text(text) => {
+                if self.current_span().valid() {
+                    self.write_wrapped(&text);
+                } else {
+                    self.write_wrapped_mapped(&text, self.text_spans(node, &text));
+                }
+            }
+            NodeValue::SoftBreak => {
+                self.write_wrapped_mapped(" ", vec![self.node_source_span(node)]);
+            }
             NodeValue::LineBreak => {
                 self.newline();
                 self.write_indent();
             }
             NodeValue::Code(code) => {
+                self.push_span(self.node_source_span(node));
                 self.push_style(TextStyle {
                     color: FG_BLUE.into(),
                     ..Default::default()
                 });
                 self.write_wrapped(&code.literal);
                 self.pop_style();
+                self.pop_span();
             }
             NodeValue::Emph => {
+                self.push_span(self.node_source_span(node));
                 self.push_style(TextStyle {
                     italic: true,
                     ..Default::default()
                 });
                 self.render_children(node, tight_list);
                 self.pop_style();
+                self.pop_span();
             }
             NodeValue::Strong => {
+                self.push_span(self.node_source_span(node));
                 self.push_style(TextStyle {
                     bold: true,
                     ..Default::default()
                 });
                 self.render_children(node, tight_list);
                 self.pop_style();
+                self.pop_span();
             }
             NodeValue::Highlight => {
+                self.push_span(self.node_source_span(node));
                 let background = self.render_style.highlight_bg.clone();
                 self.push_style(TextStyle {
                     background,
@@ -369,6 +469,7 @@ impl AnsiRenderer {
                 });
                 self.render_children(node, tight_list);
                 self.pop_style();
+                self.pop_span();
             }
             NodeValue::Strikethrough => {
                 self.write_raw("<del>");
@@ -376,6 +477,7 @@ impl AnsiRenderer {
                 self.write_raw("</del>");
             }
             NodeValue::Link(link) => {
+                self.push_span(self.node_source_span(node));
                 if self
                     .node_source(node)
                     .is_some_and(|source| !source.starts_with('['))
@@ -384,16 +486,20 @@ impl AnsiRenderer {
                 } else {
                     self.render_link(node, &link.url, tight_list);
                 }
+                self.pop_span();
             }
             NodeValue::Image(_) => {
+                self.push_span(self.node_source_span(node));
                 self.write_raw("[image: ");
                 self.render_children(node, tight_list);
                 self.write_raw("]");
+                self.pop_span();
             }
             NodeValue::HtmlInline(html) | NodeValue::Raw(html) => self.write_raw(&html),
             NodeValue::Table(table) => self.render_table(node, &table.alignments),
             NodeValue::TableRow(_) | NodeValue::TableCell => self.render_children(node, tight_list),
             NodeValue::TaskItem(task) => {
+                self.push_span(self.node_block_span(node));
                 self.indent_stack.push(self.indent);
                 let prefix = format!("{}    ", "  ".repeat(self.list_depth.saturating_sub(1)));
                 self.write_raw(&prefix);
@@ -408,6 +514,7 @@ impl AnsiRenderer {
                 self.render_children(node, tight_list);
                 self.indent = self.indent_stack.pop().unwrap_or(0);
                 self.newline();
+                self.pop_span();
             }
             _ => self.render_children(node, tight_list),
         }
@@ -420,6 +527,7 @@ impl AnsiRenderer {
     }
 
     fn render_list_item<'a>(&mut self, node: &'a AstNode<'a>, tight: bool) {
+        self.push_span(self.node_block_span(node));
         self.indent_stack.push(self.indent);
         let nested = "  ".repeat(self.list_depth.saturating_sub(1));
         let is_task = node
@@ -440,6 +548,7 @@ impl AnsiRenderer {
         self.indent = self.col;
         self.render_children(node, tight);
         self.indent = self.indent_stack.pop().unwrap_or(0);
+        self.pop_span();
         self.newline();
     }
 
@@ -502,6 +611,73 @@ impl AnsiRenderer {
         line.get(start..end)
     }
 
+    fn node_source_span(&self, node: &AstNode<'_>) -> SourceSpan {
+        let position = node.data.borrow().sourcepos;
+        let Some(start) = self.source_offset(position.start.line, position.start.column) else {
+            return SourceSpan::default();
+        };
+        let Some(end_start) = self.source_offset(position.end.line, position.end.column) else {
+            return SourceSpan::default();
+        };
+        let end = (end_start + 1).min(self.source.len());
+        SourceSpan { start, end }
+    }
+
+    fn node_block_span(&self, node: &AstNode<'_>) -> SourceSpan {
+        let mut span = self.node_source_span(node);
+        while span.start > 0 && self.source.as_bytes()[span.start - 1] != b'\n' {
+            span.start -= 1;
+        }
+        span
+    }
+
+    fn source_offset(&self, line: usize, column: usize) -> Option<usize> {
+        if line == 0 || column == 0 {
+            return None;
+        }
+        let line_start = self
+            .source
+            .split_inclusive('\n')
+            .take(line - 1)
+            .map(str::len)
+            .sum::<usize>();
+        let offset = line_start + column - 1;
+        (offset <= self.source.len()).then_some(offset)
+    }
+
+    fn text_spans(&self, node: &AstNode<'_>, text: &str) -> Vec<SourceSpan> {
+        let span = self.node_source_span(node);
+        let mut offset = span.start;
+        text.chars()
+            .map(|character| {
+                let size = character.len_utf8();
+                let result = SourceSpan {
+                    start: offset,
+                    end: (offset + size).min(span.end),
+                };
+                offset += size;
+                result
+            })
+            .collect()
+    }
+
+    fn push_span(&mut self, span: SourceSpan) {
+        self.span_stack.push(span);
+    }
+
+    fn pop_span(&mut self) {
+        self.span_stack.pop();
+    }
+
+    fn current_span(&self) -> SourceSpan {
+        self.span_stack
+            .iter()
+            .rev()
+            .copied()
+            .find(|span| span.valid())
+            .unwrap_or_default()
+    }
+
     fn render_table<'a>(&mut self, node: &'a AstNode<'a>, alignments: &[TableAlignment]) {
         let rows: Vec<Vec<String>> = node
             .children()
@@ -536,7 +712,7 @@ impl AnsiRenderer {
                     ),
                     _ => format!("{cell}{}", " ".repeat(padding)),
                 };
-                let _ = write!(self.output, " {aligned} |");
+                self.write_raw(&format!(" {aligned} |"));
             }
             self.newline();
             if row_index == 0 || row_index + 1 == rows.len() {
@@ -591,12 +767,11 @@ impl AnsiRenderer {
         self.output.push_str(&current.background);
     }
     fn write_raw(&mut self, text: &str) {
-        self.line += text.matches('\n').count();
         self.output.push_str(text);
+        self.record_output(text, None);
     }
     fn newline(&mut self) {
-        self.output.push('\n');
-        self.line += 1;
+        self.write_raw("\n");
         self.col = 0;
     }
     fn write_indent(&mut self) {
@@ -647,6 +822,106 @@ impl AnsiRenderer {
             self.write_raw(token);
             self.col += token_width;
         }
+    }
+
+    fn write_wrapped_mapped(&mut self, text: &str, spans: Vec<SourceSpan>) {
+        if self.width == 0 {
+            self.output.push_str(text);
+            self.record_output(text, Some(&spans));
+            return;
+        }
+        let mut span_index = 0;
+        for token in split_words(text) {
+            let token_width = display_width(token);
+            let token_chars = token.chars().count();
+            let token_spans =
+                &spans[span_index.min(spans.len())..(span_index + token_chars).min(spans.len())];
+            span_index += token_chars;
+            if token_width == 0 {
+                continue;
+            }
+            let space = token.chars().next().is_some_and(char::is_whitespace);
+            if self.col == 0 && self.indent > 0 {
+                self.write_indent();
+                self.apply_current_style();
+            }
+            if self.col > self.indent && self.col + token_width > self.width {
+                self.write_raw(RESET);
+                self.newline();
+                self.write_indent();
+                self.apply_current_style();
+                if space {
+                    continue;
+                }
+            }
+            if space && self.col == self.indent {
+                continue;
+            }
+            self.output.push_str(token);
+            self.record_output(token, Some(token_spans));
+            self.col += token_width;
+        }
+    }
+
+    fn record_output(&mut self, text: &str, spans: Option<&[SourceSpan]>) {
+        if self.line_mappings.is_empty() {
+            self.line_mappings.push(RenderLineMapping::default());
+        }
+        let default_span = self.current_span();
+        let mut span_index = 0;
+        let mut index = 0;
+        while index < text.len() {
+            if text.as_bytes()[index] == 0x1b {
+                index = escape_sequence_end(text, index);
+                continue;
+            }
+            let character = text[index..].chars().next().unwrap();
+            index += character.len_utf8();
+            if character == '\n' {
+                self.line += 1;
+                self.line_mappings.push(RenderLineMapping::default());
+                continue;
+            }
+            let span = spans
+                .and_then(|values| values.get(span_index))
+                .copied()
+                .unwrap_or(default_span);
+            self.line_mappings.last_mut().unwrap().spans.push(span);
+            span_index += 1;
+        }
+    }
+}
+
+fn escape_sequence_end(text: &str, start: usize) -> usize {
+    let bytes = text.as_bytes();
+    if bytes.get(start) != Some(&0x1b) {
+        return start + 1;
+    }
+    match bytes.get(start + 1) {
+        Some(b'[') => {
+            let mut index = start + 2;
+            while index < bytes.len() {
+                if (0x40..=0x7e).contains(&bytes[index]) {
+                    return index + 1;
+                }
+                index += 1;
+            }
+            bytes.len()
+        }
+        Some(b']') => {
+            let mut index = start + 2;
+            while index < bytes.len() {
+                if bytes[index] == 0x07 {
+                    return index + 1;
+                }
+                if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'\\') {
+                    return index + 2;
+                }
+                index += 1;
+            }
+            bytes.len()
+        }
+        _ => (start + 2).min(bytes.len()),
     }
 }
 
