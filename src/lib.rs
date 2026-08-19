@@ -11,7 +11,8 @@ mod render;
 mod style;
 
 pub use pager::{
-    EmbeddedPagerConfig, EmbeddedPagerView, PagerConfig, render_embedded_pager, run_pager,
+    EmbeddedCodeBlock, EmbeddedPagerConfig, EmbeddedPagerView, PagerConfig, copy_osc52_to,
+    render_embedded_pager, run_pager,
 };
 pub use render::{
     AnsiRenderer, CodeBlock, Heading, RenderError, RenderResult, Result, extract_headings, render,

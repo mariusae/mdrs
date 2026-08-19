@@ -42,12 +42,23 @@ pub struct EmbeddedPagerConfig {
     pub center_source_line: Option<usize>,
     pub scroll: isize,
     pub highlight_terms: Vec<String>,
+    pub render_style: RenderStyle,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct EmbeddedCodeBlock {
+    /// Zero-based row within the embedded viewport.
+    pub row: usize,
+    /// Zero-based column where the copy target is rendered.
+    pub col: usize,
+    pub text: String,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct EmbeddedPagerView {
     pub lines: Vec<String>,
     pub top_line: usize,
+    pub code_blocks: Vec<EmbeddedCodeBlock>,
 }
 
 pub fn render_embedded_pager(config: &EmbeddedPagerConfig) -> io::Result<EmbeddedPagerView> {
@@ -55,7 +66,7 @@ pub fn render_embedded_pager(config: &EmbeddedPagerConfig) -> io::Result<Embedde
         return Ok(EmbeddedPagerView::default());
     }
     let width = config.width.max(1);
-    let result = render_document_with_style(&config.source, width, true, &RenderStyle::default())
+    let result = render_document_with_style(&config.source, width, true, &config.render_style)
         .map_err(io::Error::other)?;
     let rendered = result.output.trim_end_matches('\n');
     if rendered.is_empty() {
@@ -77,20 +88,60 @@ pub fn render_embedded_pager(config: &EmbeddedPagerConfig) -> io::Result<Embedde
         .saturating_sub(config.height / 2)
         .saturating_add_signed(config.scroll)
         .min(max_top);
-    let highlight = format!("{REVERSE}{BOLD}");
+    let highlight = embedded_highlight(&config.render_style);
+    let mut code_blocks = Vec::new();
     let visible = lines
         .iter()
         .zip(&plain)
+        .enumerate()
         .skip(top)
         .take(config.height)
-        .map(|(line, plain)| {
-            highlight_all_matches(line, plain, &config.highlight_terms, &highlight)
+        .map(|(line_index, (line, plain))| {
+            let mut line = line.clone();
+            if let Some(block) = result
+                .code_blocks
+                .iter()
+                .find(|block| block.line == line_index)
+            {
+                let row = line_index - top;
+                line = replace_visible(
+                    &line,
+                    0,
+                    &format!("{DIM}⎘{RESET}{}", config.render_style.code_block_bg),
+                );
+                code_blocks.push(EmbeddedCodeBlock {
+                    row,
+                    col: 0,
+                    text: block.text.clone(),
+                });
+            }
+            highlight_all_matches(&line, plain, &config.highlight_terms, &highlight)
         })
         .collect();
     Ok(EmbeddedPagerView {
         lines: visible,
         top_line: top,
+        code_blocks,
     })
+}
+
+pub fn copy_osc52_to(mut writer: impl Write, text: &[u8]) -> io::Result<()> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    write!(
+        writer,
+        "\x1b]52;c;{}\x07",
+        base64::engine::general_purpose::STANDARD.encode(text)
+    )
+}
+
+fn embedded_highlight(render_style: &RenderStyle) -> String {
+    if render_style.highlight_bg.is_empty() {
+        format!("{REVERSE}{BOLD}")
+    } else {
+        format!("{}{BOLD}", render_style.highlight_bg)
+    }
 }
 
 pub fn run_pager(config: &PagerConfig) -> io::Result<()> {
@@ -1714,14 +1765,7 @@ fn quote_markdown(text: &[u8]) -> Vec<u8> {
     out
 }
 fn copy_osc52(tty: &mut File, text: &[u8]) -> io::Result<()> {
-    if text.is_empty() {
-        return Ok(());
-    }
-    write!(
-        tty,
-        "\x1b]52;c;{}\x07",
-        base64::engine::general_purpose::STANDARD.encode(text)
-    )
+    copy_osc52_to(tty, text)
 }
 fn merge_spans(spans: Vec<SourceSpan>) -> Vec<SourceSpan> {
     let mut merged: Vec<SourceSpan> = vec![];
@@ -2462,6 +2506,54 @@ mod tests {
         let rendered = view.lines.join("\n");
         assert!(rendered.contains(REVERSE));
         assert!(!strip_ansi(&rendered).contains("100%"));
+    }
+    #[test]
+    fn embedded_pager_uses_render_style_for_code_blocks_and_highlights() {
+        let view = render_embedded_pager(&EmbeddedPagerConfig {
+            source: b"```rust\nlet alpha = 1;\n```\n".to_vec(),
+            width: 80,
+            height: 4,
+            highlight_terms: vec!["alpha".into()],
+            render_style: RenderStyle {
+                code_block_bg: "\x1b[48;5;250m".into(),
+                highlight_bg: "\x1b[48;5;240m".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .unwrap();
+        let rendered = view.lines.join("\n");
+        assert!(rendered.contains("⎘"));
+        assert!(rendered.contains("\x1b[48;5;250m"));
+        assert!(rendered.contains("\x1b[48;5;240m"));
+    }
+    #[test]
+    fn embedded_pager_returns_visible_code_block_targets() {
+        let view = render_embedded_pager(&EmbeddedPagerConfig {
+            source: b"intro\n\n```\ncopy me\n```\n".to_vec(),
+            width: 80,
+            height: 8,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            view.code_blocks,
+            vec![EmbeddedCodeBlock {
+                row: 2,
+                col: 0,
+                text: "copy me\n".into(),
+            }]
+        );
+    }
+    #[test]
+    fn copy_osc52_to_writes_base64_payload() {
+        let mut output = Vec::new();
+        copy_osc52_to(&mut output, b"hello").unwrap();
+        assert_eq!(String::from_utf8(output).unwrap(), "\x1b]52;c;aGVsbG8=\x07");
+
+        let mut empty = Vec::new();
+        copy_osc52_to(&mut empty, b"").unwrap();
+        assert!(empty.is_empty());
     }
     #[test]
     fn relative_times() {
