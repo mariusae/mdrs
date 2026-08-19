@@ -639,8 +639,8 @@ impl Pager {
                 self.flow = !self.flow;
                 let _ = self.rebuild();
             }
-            Key::Char('[') => self.navigate_back(),
-            Key::Char(']') => self.navigate_forward(),
+            Key::Char('[') | Key::Left | Key::Backspace => self.navigate_back(),
+            Key::Char(']') | Key::Right => self.navigate_forward(),
             Key::Char('q') | Key::Ctrl('c') => return true,
             _ => {}
         }
