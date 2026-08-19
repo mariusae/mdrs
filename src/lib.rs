@@ -3,8 +3,8 @@
 //!
 //! The primary Rust API returns owned values. Writer-oriented variants are
 //! available when output should be streamed into an existing buffer.
-//! [`run_pager`] exposes the interactive pager as a library API; this crate has
-//! no command-line binary.
+//! [`run_pager`] exposes the interactive pager as a library API. The bundled
+//! binary is a thin argument-and-input adapter around that function.
 
 mod pager;
 mod render;

@@ -1,8 +1,7 @@
 # mdrs
 
 Rust library for rendering GitHub-flavored Markdown as ANSI terminal text.
-Its behavior is compatible with the Go package at
-`github.com/mariusae/md`; this crate intentionally does not provide a CLI.
+Its behavior is compatible with the Go package at `github.com/mariusae/md`.
 
 ```rust
 let rendered = mdrs::render(b"# Hello\n", 80, false)?;
@@ -27,3 +26,17 @@ filtered heading outline, help overlay, live file reload and change flashes,
 mouse scrolling and selection, source-preserving Markdown copy, code-block
 copy buttons, OSC-52 clipboard support, status breadcrumbs, terminal tinting,
 focus handling, and resize handling.
+
+The included CLI is intentionally thin and delegates display behavior to the
+library pager:
+
+```sh
+cargo run -- README.md
+```
+
+It also accepts multiple files, stdin, and an optional fixed width:
+
+```sh
+cargo run -- --width 100 README.md CHANGELOG.md
+printf '# Hello\n' | cargo run
+```
